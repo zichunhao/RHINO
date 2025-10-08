@@ -38,71 +38,63 @@ def update_momentum_encoder(student, teacher, m):
         # This is equivalent to the above line but avoids creating a new tensor
         param_t.data.mul_(m).add_(param_s.data, alpha=(1 - m))
 
-def aggregate_losses(all_batch_losses, accelerator=None):
+def aggregate_losses(all_batch_losses, accelerator: Accelerator | None = None):
     """
-    Properly aggregate losses using batch sizes for weighted averaging.
-    
+    Aggregate (average) loss metrics across batches and processes correctly
+    using sample-weighted means.
+
     Args:
-        all_batch_losses: List of dictionaries containing batch losses (including 'batch_size')
-        accelerator: Accelerator instance for distributed training
-    
+        all_batch_losses (list[dict]): List of per-batch loss dictionaries.
+        accelerator (Accelerator, optional): HF Accelerator instance.
+
     Returns:
-        Dictionary with properly weighted aggregated losses
+        dict[str, float]: Aggregated mean losses across all batches and processes.
     """
     if not all_batch_losses:
         return {}
-    
-    # Get all unique keys (excluding dom* metrics and batch_size for final averaging)
+
+    # Collect metric keys
     all_keys = set()
     for batch_loss in all_batch_losses:
         all_keys.update(
             k for k in batch_loss.keys()
             if k not in ["batch_size", "dom_unique"] and "dom_top" not in k
         )
+    
+    # CRITICAL: Sort keys to ensure consistent order across all processes
+    all_keys = sorted(list(all_keys))
 
-    if accelerator is not None:
-        # For distributed training: gather batch sizes and losses separately
-        batch_sizes = [batch_loss["batch_size"] for batch_loss in all_batch_losses]
-        batch_sizes_tensor = torch.tensor(batch_sizes, device=accelerator.device, dtype=torch.float32)
-        
-        # Gather batch sizes from all processes
-        all_batch_sizes = accelerator.gather(batch_sizes_tensor)
-        total_samples = all_batch_sizes.sum().item()
-        
-        gathered_losses = {}
-        for key in all_keys:
-            # Get weighted values (loss * batch_size) for this key from all batches on this process
-            weighted_values = []
-            for batch_loss in all_batch_losses:
-                loss_val = batch_loss.get(key, 0.0)
-                batch_size = batch_loss["batch_size"]
-                weighted_values.append(loss_val * batch_size)
-            
-            # Convert to tensor
-            weighted_tensor = torch.tensor(weighted_values, device=accelerator.device, dtype=torch.float32)
-            
-            # Gather weighted values from all processes
-            all_weighted_values = accelerator.gather(weighted_tensor)
-            
-            # Compute weighted average: sum(loss * batch_size) / sum(batch_size)
-            total_weighted_sum = all_weighted_values.sum().item()
-            gathered_losses[key] = total_weighted_sum / total_samples
-            
-        return gathered_losses
-    else:
-        # For single process: compute weighted average normally
-        total_samples = sum(batch_loss["batch_size"] for batch_loss in all_batch_losses)
-        
-        loss_dict = {}
-        for key in all_keys:
-            weighted_sum = sum(
-                batch_loss.get(key, 0.0) * batch_loss["batch_size"] 
-                for batch_loss in all_batch_losses
-            )
-            loss_dict[key] = weighted_sum / total_samples
-            
-        return loss_dict
+    aggregated = {}
 
+    for key in all_keys:
+        # Extract values and batch sizes for this key
+        local_values = torch.tensor(
+            [batch_loss.get(key, 0.0) for batch_loss in all_batch_losses],
+            dtype=torch.float32,
+        )
+        local_batch_sizes = torch.tensor(
+            [batch_loss.get("batch_size", 1.0) for batch_loss in all_batch_losses],
+            dtype=torch.float32,
+        )
+        
+        local_weighted_sum = (local_values * local_batch_sizes).sum()
+        local_total_samples = local_batch_sizes.sum()
+        
+        # Gather across processes if using distributed training
+        if accelerator is not None and accelerator.num_processes > 1:
+            local_weighted_sum = local_weighted_sum.to(accelerator.device)
+            local_total_samples = local_total_samples.to(accelerator.device)
+            
+            global_weighted_sum = accelerator.reduce(local_weighted_sum, reduction="sum")
+            global_total_samples = accelerator.reduce(local_total_samples, reduction="sum")
+            
+            weighted_mean = (global_weighted_sum / global_total_samples).item()
+        else:
+            weighted_mean = (local_weighted_sum / local_total_samples).item()
+        
+        aggregated[key] = weighted_mean
+
+    return aggregated
 
 def cosine_scheduler(
     base_value: float,
@@ -473,6 +465,7 @@ def train(config: dict[str, Any]) -> None:
         start_warmup_value=config["training"].get("teacher_momentum_warmup_start", 0.0),
     )
 
+    should_stop = False
     for epoch in range(start_epoch, start_epoch + num_epochs):
         if epoch == 0 and part_batch_norm is not None:
             part_batch_norm.train()
@@ -601,9 +594,19 @@ def train(config: dict[str, Any]) -> None:
                         f"Validation loss has not improved for {patience} epochs. "
                         f"Stopping training at epoch {epoch}."
                     )
-                break
+                should_stop = True
         if should_save_and_log(accelerator):
             LOGGER.info(f"num_stale_epochs/patience: {num_stale_epochs}/{patience}")
+            
+        if should_stop:
+            if (accelerator is not None) and (accelerator.num_processes > 1) and (accelerator.is_main_process):
+                accelerator.set_trigger()
+            else:
+                break
+        
+        if accelerator is not None:
+            if accelerator.check_trigger():
+                break
 
     if should_save_and_log(accelerator):
         # Save the final model
